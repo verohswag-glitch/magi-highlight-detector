@@ -171,7 +171,6 @@ module.exports = async (req, res) => {
 // 赤縦線検出: 赤マスク → BFS 4連結フラッドフィル → フィルタ
 // ============================================================
 function detectRedLines(image, width, height) {
-  // 赤マスク生成
   const redMask = new Uint8Array(width * height);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -216,34 +215,31 @@ function detectRedLines(image, width, height) {
           if (cy > cyMax) cyMax = cy;
 
           // 4連結: 上下左右
-          const neighbors = [
-            cy > 0 ? (cy - 1) * width + cx : -1,
-            cy < height - 1 ? (cy + 1) * width + cx : -1,
-            cx > 0 ? cy * width + (cx - 1) : -1,
-            cx < width - 1 ? cy * width + (cx + 1) : -1,
-          ];
-          for (const nPos of neighbors) {
-            if (nPos >= 0 && redMask[nPos] && !visited[nPos]) {
-              visited[nPos] = 1;
-              queue.push(nPos);
-            }
+          if (cy > 0 && redMask[(cy - 1) * width + cx] && !visited[(cy - 1) * width + cx]) {
+            visited[(cy - 1) * width + cx] = 1;
+            queue.push((cy - 1) * width + cx);
+          }
+          if (cy < height - 1 && redMask[(cy + 1) * width + cx] && !visited[(cy + 1) * width + cx]) {
+            visited[(cy + 1) * width + cx] = 1;
+            queue.push((cy + 1) * width + cx);
+          }
+          if (cx > 0 && redMask[cy * width + (cx - 1)] && !visited[cy * width + (cx - 1)]) {
+            visited[cy * width + (cx - 1)] = 1;
+            queue.push(cy * width + (cx - 1));
+          }
+          if (cx < width - 1 && redMask[cy * width + (cx + 1)] && !visited[cy * width + (cx + 1)]) {
+            visited[cy * width + (cx + 1)] = 1;
+            queue.push(cy * width + (cx + 1));
           }
         }
 
-        components.push({
-          xMin: cxMin, xMax: cxMax,
-          yMin: cyMin, yMax: cyMax,
-          pixelCount,
-        });
+        components.push({ xMin: cxMin, xMax: cxMax, yMin: cyMin, yMax: cyMax, pixelCount });
       }
     }
   }
 
   // 縦線フィルタ
-  const minHeight = Math.max(
-    CONFIG.RED_MIN_HEIGHT_PX,
-    height * CONFIG.RED_MIN_HEIGHT_RATIO
-  );
+  const minHeight = Math.max(CONFIG.RED_MIN_HEIGHT_PX, height * CONFIG.RED_MIN_HEIGHT_RATIO);
   const lines = [];
 
   for (const comp of components) {
@@ -310,7 +306,7 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
     (l) => l.xMax <= rightXMin + CONFIG.ASSOCIATION_X_MARGIN
   );
 
-  // (3) どちらのグループにもE-L紐付けが成立しない → v1.2互換にフォールバック
+  // (3) どちらにもE-L紐付け不成立 → v1.2互換にフォールバック
   if (!hasLeftLine && !hasRightLine) {
     const cropBuf = await cropRegionBase64(
       image, region.xMin, region.yStart,
@@ -334,7 +330,6 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
   // 左段クロップ
   if (hasLeftPixels) {
     if (hasLeftLine) {
-      // 赤縦線あり → 右端を55%に制限
       const clippedXMax = Math.min(leftXMax, cropRightLimit);
       const cropBuf = await cropRegionBase64(
         image, leftXMin, leftYMin,
@@ -348,7 +343,6 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
         image_base64: cropBuf,
       });
     } else {
-      // 赤縦線なし → v1.2互換（制限なし）
       const cropBuf = await cropRegionBase64(
         image, leftXMin, leftYMin,
         leftXMax - leftXMin + 1, leftYMax - leftYMin + 1
@@ -366,7 +360,6 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
   // 右段クロップ
   if (hasRightPixels) {
     if (hasRightLine) {
-      // 赤縦線あり → 左端を45%に制限
       const clippedXMin = Math.max(rightXMin, cropLeftLimit);
       const cropBuf = await cropRegionBase64(
         image, clippedXMin, rightYMin,
@@ -380,7 +373,6 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
         image_base64: cropBuf,
       });
     } else {
-      // 赤縦線なし → v1.2互換（制限なし）
       const cropBuf = await cropRegionBase64(
         image, rightXMin, rightYMin,
         rightXMax - rightXMin + 1, rightYMax - rightYMin + 1
