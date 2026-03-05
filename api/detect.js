@@ -33,8 +33,8 @@ const CONFIG = {
   COLUMN_RIGHT_CROP_LIMIT: 0.45,
 
   // --- 最小クロップサイズフィルタ（v1.5新規） ---
-  MIN_CROP_WIDTH: 20,
-  MIN_CROP_HEIGHT: 15,
+  MIN_CROP_WIDTH: 50,
+  MIN_CROP_HEIGHT: 20,
 };
 
 module.exports = async (req, res) => {
