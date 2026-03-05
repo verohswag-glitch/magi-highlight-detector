@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 
 const CONFIG = {
+  // ===== v1.2 既存（変更なし） =====
   RB_THRESHOLD: 40,
   G_MIN: 170,
   R_MIN: 200,
@@ -14,6 +15,12 @@ const CONFIG = {
   X_GAP_THRESHOLD: 30,
   WIDE_REGION_RATIO: 0.45,
   MIN_COLUMN_WIDTH_RATIO: 0.10,
+
+  // ===== v1.3 D-α段組検出 =====
+  COLUMN_GAP_MIN_WIDTH: 20,       // 段間ギャップの最小幅（px）
+  COLUMN_SCAN_LEFT: 0.30,         // 段境界を探す範囲の左端（画像幅の30%）
+  COLUMN_SCAN_RIGHT: 0.70,        // 段境界を探す範囲の右端（画像幅の70%）
+  COLUMN_DENSITY_THRESHOLD: 0.02, // この密度以下の列を「空白」と判定（行数に対する比率）
 };
 
 export default async function handler(req, res) {
@@ -52,6 +59,9 @@ export default async function handler(req, res) {
     }
 
     const dilated = dilate(mask, width, height, CONFIG.DILATE_KERNEL_W, CONFIG.DILATE_KERNEL_H);
+
+    // ===== v1.3: D-α 段組検出（画像全体のテキスト密度プロファイル） =====
+    const columnInfo = detectColumns(data, width, height, channels);
 
     // ===== Y軸プロファイル → 行リージョン検出 =====
     const yProfile = new Uint32Array(height);
@@ -132,13 +142,19 @@ export default async function handler(req, res) {
         crops: [],
         image_width: width,
         image_height: height,
+        column_detected: columnInfo.detected,
         message: 'NO_HIGHLIGHTS'
       });
     }
 
+    // ===== v1.3: 段組検出時はクロップを段内に制約 =====
+    const constrainedRegions = columnInfo.detected
+      ? validRegions.map(r => constrainToColumn(r, columnInfo, width))
+      : validRegions;
+
     const crops = [];
-    for (let i = 0; i < validRegions.length; i++) {
-      const r = validRegions[i];
+    for (let i = 0; i < constrainedRegions.length; i++) {
+      const r = constrainedRegions[i];
       const cropX = Math.max(0, r.xMin - CONFIG.CROP_MARGIN_X);
       const cropY = Math.max(0, r.yStart - CONFIG.CROP_MARGIN_Y);
       const cropW = Math.min(width - cropX, (r.xMax - r.xMin) + CONFIG.CROP_MARGIN_X * 2);
@@ -158,10 +174,12 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
-      highlight_count: validRegions.length,
+      highlight_count: constrainedRegions.length,
       crops,
       image_width: width,
-      image_height: height
+      image_height: height,
+      column_detected: columnInfo.detected,
+      column_boundary: columnInfo.detected ? columnInfo.boundary : null
     });
 
   } catch (err) {
@@ -170,7 +188,96 @@ export default async function handler(req, res) {
   }
 }
 
-// ===== X軸ギャップ分割 =====
+// ===== v1.3: D-α 段組検出 =====
+// 画像全体の「暗いピクセル」（テキスト領域）のX軸密度プロファイルを計算し、
+// 画像中央付近（30%-70%）に低密度の縦溝があれば「2段組」と判定する。
+function detectColumns(rawData, width, height, channels) {
+  const scanLeft = Math.floor(width * CONFIG.COLUMN_SCAN_LEFT);
+  const scanRight = Math.floor(width * CONFIG.COLUMN_SCAN_RIGHT);
+
+  // X軸の「テキストらしいピクセル」密度プロファイル
+  // テキスト = 暗いピクセル（brightness < 128）
+  const xDensity = new Uint32Array(width);
+  for (let x = scanLeft; x < scanRight; x++) {
+    let count = 0;
+    for (let y = 0; y < height; y++) {
+      const idx = (y * width + x) * channels;
+      const r = rawData[idx];
+      const g = rawData[idx + 1];
+      const b = rawData[idx + 2];
+      const brightness = (r + g + b) / 3;
+      if (brightness < 128) count++;
+    }
+    xDensity[x] = count;
+  }
+
+  // 低密度帯（縦溝）を探す
+  const densityThreshold = Math.floor(height * CONFIG.COLUMN_DENSITY_THRESHOLD);
+
+  let bestGapStart = -1;
+  let bestGapLen = 0;
+  let gapStart = -1;
+
+  for (let x = scanLeft; x < scanRight; x++) {
+    if (xDensity[x] <= densityThreshold) {
+      if (gapStart === -1) gapStart = x;
+    } else {
+      if (gapStart !== -1) {
+        const gapLen = x - gapStart;
+        if (gapLen > bestGapLen) {
+          bestGapLen = gapLen;
+          bestGapStart = gapStart;
+        }
+        gapStart = -1;
+      }
+    }
+  }
+  if (gapStart !== -1) {
+    const gapLen = scanRight - gapStart;
+    if (gapLen > bestGapLen) {
+      bestGapLen = gapLen;
+      bestGapStart = gapStart;
+    }
+  }
+
+  if (bestGapLen < CONFIG.COLUMN_GAP_MIN_WIDTH) {
+    return { detected: false };
+  }
+
+  // 段境界 = ギャップの中央
+  const boundary = Math.floor(bestGapStart + bestGapLen / 2);
+
+  return {
+    detected: true,
+    boundary,          // 段境界のX座標
+    gapStart: bestGapStart,
+    gapEnd: bestGapStart + bestGapLen,
+    gapWidth: bestGapLen
+  };
+}
+
+// ===== v1.3: クロップを段内に制約 =====
+// マーカー領域の中心X座標が段境界の左右どちらかで、クロップ範囲を段内に収める
+function constrainToColumn(region, columnInfo, imageWidth) {
+  const regionCenterX = Math.floor((region.xMin + region.xMax) / 2);
+  const boundary = columnInfo.boundary;
+
+  if (regionCenterX < boundary) {
+    // 左段: クロップの右端を段境界のギャップ開始位置に制限
+    return {
+      ...region,
+      xMax: Math.min(region.xMax, columnInfo.gapStart - 1)
+    };
+  } else {
+    // 右段: クロップの左端を段境界のギャップ終了位置に制限
+    return {
+      ...region,
+      xMin: Math.max(region.xMin, columnInfo.gapEnd)
+    };
+  }
+}
+
+// ===== X軸ギャップ分割（v1.2から変更なし） =====
 function splitByXGap(dilated, imgWidth, yStart, yEnd, xMin, xMax) {
   const xProfile = new Uint32Array(imgWidth);
   for (let x = xMin; x <= xMax; x++) {
