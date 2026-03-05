@@ -1,6 +1,7 @@
 // ============================================================
-// detect.js v1.4 — 赤縦線ベース2段組制御 + 黄色マーカー検出
+// detect.js v1.5 — 赤縦線ベース2段組制御 + 黄色マーカー検出
 // Round 9 確定仕様（Claude + Gemini統合設計 + 秘書くん修正提案）
+// v1.5: CD_ExpandCrops フィールド整合 + 最小クロップフィルタ
 // ============================================================
 const Jimp = require('jimp');
 
@@ -30,6 +31,10 @@ const CONFIG = {
   COLUMN_BOUNDARY: 0.50,
   COLUMN_LEFT_CROP_LIMIT: 0.55,
   COLUMN_RIGHT_CROP_LIMIT: 0.45,
+
+  // --- 最小クロップサイズフィルタ（v1.5新規） ---
+  MIN_CROP_WIDTH: 20,
+  MIN_CROP_HEIGHT: 15,
 };
 
 module.exports = async (req, res) => {
@@ -100,7 +105,7 @@ module.exports = async (req, res) => {
     // ================================================
     // Step 3: 赤縦線紐付け + クロップ生成
     // ================================================
-    const crops = [];
+    const rawCrops = [];
 
     for (const region of regions) {
       // Y範囲が重なる赤縦線を取得（E-Lはまだ未検証）
@@ -113,26 +118,34 @@ module.exports = async (req, res) => {
         const columnCrops = await splitByRedLines(
           dilated, image, width, height, region, yOverlappingLines
         );
-        crops.push(...columnCrops);
+        rawCrops.push(...columnCrops);
       } else {
         // 赤縦線なし → v1.2互換（制限なしクロップ）
         const cropBuf = await cropRegionBase64(
           image, region.xMin, region.yStart,
           region.xMax - region.xMin + 1, region.yEnd - region.yStart + 1
         );
-        crops.push({
+        rawCrops.push({
           x: region.xMin,
           y: region.yStart,
           width: region.xMax - region.xMin + 1,
           height: region.yEnd - region.yStart + 1,
           column: 'none',
-          image_base64: cropBuf,
+          base64: cropBuf,
         });
       }
     }
 
     // ================================================
+    // Step 3.5: 最小クロップサイズフィルタ（v1.5新規）
+    // ================================================
+    const crops = rawCrops.filter(
+      (c) => c.width >= CONFIG.MIN_CROP_WIDTH && c.height >= CONFIG.MIN_CROP_HEIGHT
+    );
+
+    // ================================================
     // Step 4: レスポンス
+    // CD_ExpandCrops が期待するフィールド: base64, index, bbox, area
     // ================================================
     return res.status(200).json({
       image_width: width,
@@ -148,15 +161,19 @@ module.exports = async (req, res) => {
         columnSide:
           l.xCenter < width * CONFIG.COLUMN_BOUNDARY ? 'left' : 'right',
       })),
-      crops: crops.map((c) => ({
+      crops: crops.map((c, i) => ({
         x: c.x,
         y: c.y,
         width: c.width,
         height: c.height,
         column: c.column,
-        image_base64: c.image_base64,
+        base64: c.base64,
+        index: i,
+        bbox: { x: c.x, y: c.y, width: c.width, height: c.height },
+        area: c.width * c.height,
       })),
       crop_count: crops.length,
+      highlight_count: crops.length,
     });
   } catch (error) {
     console.error('Detection error:', error);
@@ -318,7 +335,7 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
       width: region.xMax - region.xMin + 1,
       height: region.yEnd - region.yStart + 1,
       column: 'none',
-      image_base64: cropBuf,
+      base64: cropBuf,
     }];
   }
 
@@ -340,7 +357,7 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
         width: clippedXMax - leftXMin + 1,
         height: leftYMax - leftYMin + 1,
         column: 'left',
-        image_base64: cropBuf,
+        base64: cropBuf,
       });
     } else {
       const cropBuf = await cropRegionBase64(
@@ -352,7 +369,7 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
         width: leftXMax - leftXMin + 1,
         height: leftYMax - leftYMin + 1,
         column: 'none',
-        image_base64: cropBuf,
+        base64: cropBuf,
       });
     }
   }
@@ -370,7 +387,7 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
         width: rightXMax - clippedXMin + 1,
         height: rightYMax - rightYMin + 1,
         column: 'right',
-        image_base64: cropBuf,
+        base64: cropBuf,
       });
     } else {
       const cropBuf = await cropRegionBase64(
@@ -382,7 +399,7 @@ async function splitByRedLines(dilated, image, width, height, region, yOverlappi
         width: rightXMax - rightXMin + 1,
         height: rightYMax - rightYMin + 1,
         column: 'none',
-        image_base64: cropBuf,
+        base64: cropBuf,
       });
     }
   }
