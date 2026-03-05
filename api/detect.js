@@ -1,6 +1,9 @@
 // ============================================================
-// detect.js v1.6 — 赤縦線先行カラム分割 + カラム独立黄色マーカー検出
-// v1.6: Error 19修正 — 赤縦線で先にROI分割、各カラム独立にY軸処理
+// detect.js v1.6.1 — 密度閾値 + 1パス統合 + MAX_CROP_HEIGHT安全網
+// v1.6.1: Error 20修正（密度閾値で図表疑陽性除去）
+//         Error 21修正（1パス統合でY_GAP_THRESHOLD未満gap分割防止）
+//         Error 19再発防止（MAX_CROP_HEIGHT超過cropを強制再分割）
+// v1.6:   Error 19修正 — 赤縦線で先にROI分割、各カラム独立にY軸処理
 // 赤縦線なし → カラム1つ(全幅)として同一パスで処理（v1.2互換）
 // ============================================================
 const Jimp = require('jimp');
@@ -14,6 +17,12 @@ const CONFIG = {
   DILATE_RADIUS: 2,
   MIN_REGION_HEIGHT: 10,
   Y_GAP_THRESHOLD: 30,
+
+  // --- 黄色密度閾値（v1.6.1新規 — Error 20対策） ---
+  YELLOW_DENSITY_MIN: 0.03,
+
+  // --- 最大クロップ高さ（v1.6.1新規 — Error 19再発防止） ---
+  MAX_CROP_HEIGHT: 500,
 
   // --- 赤縦線検出（v1.4新規） ---
   RED_RG_THRESHOLD: 100,
@@ -80,39 +89,54 @@ module.exports = async (req, res) => {
     // ================================================
     // Step 3: カラム定義 → カラム別に独立して領域抽出
     // v1.6核心: 赤縦線ありなら先にROI分割してからY軸処理
-    // 赤縦線なし → カラム1つ(全幅, label='none')で同一パス
+    // v1.6.1: 密度閾値 + 1パス統合 + MAX_CROP_HEIGHT安全網
     // ================================================
     const columns = defineColumns(redLines, width);
     const rawCrops = [];
 
     for (const col of columns) {
+      const colWidth = col.xEnd - col.xStart + 1;
+
       // カラム内のY軸プロジェクション（カラムX範囲のみカウント）
+      // v1.6.1: 密度閾値適用 — yellowCount/colWidth < YELLOW_DENSITY_MIN → yProfile=0
       const yProfile = new Uint32Array(height);
       for (let y = 0; y < height; y++) {
+        let yellowCount = 0;
         for (let x = col.xStart; x <= col.xEnd; x++) {
           if (dilated[y * width + x]) {
-            yProfile[y]++;
+            yellowCount++;
           }
         }
+        // v1.6.1: 密度閾値 — 図表罫線等の疑陽性をゼロ化
+        if (yellowCount / colWidth >= CONFIG.YELLOW_DENSITY_MIN) {
+          yProfile[y] = yellowCount;
+        }
+        // else: yProfile[y] は初期値0のまま
       }
 
-      // カラム内の領域抽出
-      const rawRegions = extractRegionsInColumn(
+      // v1.6.1: 1パス統合 — extractRegionsInColumn + splitByYGapInColumn を統合
+      // Y_GAP_THRESHOLD未満のgapでは分割しない（Error 21修正）
+      const regions = extractAndSplitRegionsInColumn(
         dilated, yProfile, width, height, col.xStart, col.xEnd
       );
 
-      // カラム内のY軸ギャップによるサブ分割
-      const regions = [];
-      for (const region of rawRegions) {
-        regions.push(
-          ...splitByYGapInColumn(
-            dilated, width, region, CONFIG.Y_GAP_THRESHOLD, col.xStart, col.xEnd
-          )
-        );
+      // v1.6.1: MAX_CROP_HEIGHT安全網 — 超過cropを最大gapで強制再分割
+      const finalRegions = [];
+      for (const region of regions) {
+        const regionHeight = region.yEnd - region.yStart + 1;
+        if (regionHeight > CONFIG.MAX_CROP_HEIGHT) {
+          finalRegions.push(
+            ...splitOversizedRegion(
+              dilated, width, region, col.xStart, col.xEnd
+            )
+          );
+        } else {
+          finalRegions.push(region);
+        }
       }
 
       // カラム内のクロップ生成
-      for (const region of regions) {
+      for (const region of finalRegions) {
         const cropBuf = await cropRegionBase64(
           image, region.xMin, region.yStart,
           region.xMax - region.xMin + 1, region.yEnd - region.yStart + 1
@@ -316,98 +340,155 @@ function detectRedLines(image, width, height) {
 }
 
 // ============================================================
-// カラム内領域抽出（Y軸プロジェクションベース）
-// extractRegionsのカラム制限版
+// v1.6.1: 1パス統合 — 領域抽出 + Y軸ギャップ分割を統合
+// 旧: extractRegionsInColumn → splitByYGapInColumn（2段階）
+// 新: 1パスでY_GAP_THRESHOLD以上のgapのみで分割
+// これによりError 21（微小gapでの文章途中切れ）を修正
 // ============================================================
-function extractRegionsInColumn(dilated, yProfile, width, height, colXStart, colXEnd) {
+function extractAndSplitRegionsInColumn(dilated, yProfile, width, height, colXStart, colXEnd) {
   const regions = [];
   let inRegion = false;
   let regionStart = 0;
+  let gapStart = -1;
 
   for (let y = 0; y <= height; y++) {
     const active = y < height && yProfile[y] > 0;
+
     if (active && !inRegion) {
+      // 領域開始
       inRegion = true;
       regionStart = y;
+      gapStart = -1;
+    } else if (active && inRegion) {
+      // 領域継続中 — gapカウントリセット
+      if (gapStart >= 0) {
+        const gapSize = y - gapStart;
+        if (gapSize >= CONFIG.Y_GAP_THRESHOLD) {
+          // 閾値以上のgap → ここで分割
+          const bounds = computeRegionBoundsInColumn(
+            dilated, width, regionStart, gapStart - 1, colXStart, colXEnd
+          );
+          if (bounds) regions.push(bounds);
+          regionStart = y;
+        }
+        // 閾値未満のgap → 分割しない（Error 21修正の核心）
+        gapStart = -1;
+      }
     } else if (!active && inRegion) {
-      inRegion = false;
-      const regionHeight = y - regionStart;
-      if (regionHeight >= CONFIG.MIN_REGION_HEIGHT) {
-        let xMin = colXEnd + 1;
-        let xMax = colXStart - 1;
-        for (let ry = regionStart; ry < y; ry++) {
-          for (let rx = colXStart; rx <= colXEnd; rx++) {
-            if (dilated[ry * width + rx]) {
-              if (rx < xMin) xMin = rx;
-              if (rx > xMax) xMax = rx;
-            }
-          }
+      // gap開始（ただしまだ領域終了とは判定しない）
+      if (gapStart < 0) {
+        gapStart = y;
+      }
+      // 画像末端チェック
+      if (y === height) {
+        // 画像の最後まで来た → gap中の領域を確定
+        const endY = gapStart > 0 ? gapStart - 1 : y - 1;
+        if (endY >= regionStart) {
+          const bounds = computeRegionBoundsInColumn(
+            dilated, width, regionStart, endY, colXStart, colXEnd
+          );
+          if (bounds) regions.push(bounds);
         }
-        if (xMin <= xMax) {
-          regions.push({ yStart: regionStart, yEnd: y - 1, xMin, xMax });
-        }
+        inRegion = false;
       }
     }
   }
-  return regions;
+
+  // MIN_REGION_HEIGHTフィルタ
+  return regions.filter(
+    (r) => (r.yEnd - r.yStart + 1) >= CONFIG.MIN_REGION_HEIGHT
+  );
 }
 
 // ============================================================
-// カラム内Y軸ギャップによるサブ分割
-// splitByYGapのカラム制限版
+// v1.6.1: MAX_CROP_HEIGHT超過cropを最大gapで強制再分割
+// 超過regionを2分割 → 再帰的にさらに超過があれば分割
+// 分割点: region内で黄色ピクセルが最も少ない行（最大gap）
 // ============================================================
-function splitByYGapInColumn(dilated, width, region, gapThreshold, colXStart, colXEnd) {
-  const subRegions = [];
-  let currentStart = region.yStart;
+function splitOversizedRegion(dilated, width, region, colXStart, colXEnd) {
+  const regionHeight = region.yEnd - region.yStart + 1;
+  if (regionHeight <= CONFIG.MAX_CROP_HEIGHT) {
+    return [region];
+  }
 
+  // 各行の黄色ピクセル数をカウント
+  const rowCounts = [];
   for (let y = region.yStart; y <= region.yEnd; y++) {
-    let hasPixel = false;
+    let count = 0;
     for (let x = colXStart; x <= colXEnd; x++) {
       if (dilated[y * width + x]) {
-        hasPixel = true;
-        break;
+        count++;
       }
     }
+    rowCounts.push({ y, count });
+  }
 
-    if (!hasPixel) {
-      let gapEnd = y;
-      while (gapEnd <= region.yEnd) {
-        let nextHasPixel = false;
-        for (let x = colXStart; x <= colXEnd; x++) {
-          if (dilated[gapEnd * width + x]) {
-            nextHasPixel = true;
-            break;
-          }
-        }
-        if (nextHasPixel) break;
-        gapEnd++;
-      }
+  // 分割候補: 上下端から最低20%の範囲は避ける（極端な端での分割防止）
+  const margin = Math.floor(regionHeight * 0.2);
+  const searchStart = region.yStart + margin;
+  const searchEnd = region.yEnd - margin;
 
-      const gapSize = gapEnd - y;
-      if (gapSize >= gapThreshold && y > currentStart) {
-        const sub = computeRegionBoundsInColumn(
-          dilated, width, currentStart, y - 1, colXStart, colXEnd
-        );
-        if (sub) subRegions.push(sub);
-        currentStart = gapEnd;
-      }
-      y = gapEnd - 1;
+  if (searchStart >= searchEnd) {
+    // マージンを取ると検索範囲がない → 強制的に中央で分割
+    const midY = region.yStart + Math.floor(regionHeight / 2);
+    return splitAtY(dilated, width, region, midY, colXStart, colXEnd);
+  }
+
+  // 検索範囲内で最も黄色ピクセルが少ない行を探す（最大gap = 最適分割点）
+  let bestY = -1;
+  let bestCount = Infinity;
+  for (const rc of rowCounts) {
+    if (rc.y >= searchStart && rc.y <= searchEnd && rc.count < bestCount) {
+      bestCount = rc.count;
+      bestY = rc.y;
     }
   }
 
-  if (currentStart <= region.yEnd) {
-    const sub = computeRegionBoundsInColumn(
-      dilated, width, currentStart, region.yEnd, colXStart, colXEnd
+  if (bestY < 0) {
+    // フォールバック: 中央で分割
+    bestY = region.yStart + Math.floor(regionHeight / 2);
+  }
+
+  return splitAtY(dilated, width, region, bestY, colXStart, colXEnd);
+}
+
+// ============================================================
+// 指定Y座標でregionを2分割し、再帰的に超過チェック
+// ============================================================
+function splitAtY(dilated, width, region, splitY, colXStart, colXEnd) {
+  const results = [];
+
+  // 上半分
+  if (splitY > region.yStart) {
+    const upper = computeRegionBoundsInColumn(
+      dilated, width, region.yStart, splitY - 1, colXStart, colXEnd
     );
-    if (sub) subRegions.push(sub);
+    if (upper) {
+      results.push(
+        ...splitOversizedRegion(dilated, width, upper, colXStart, colXEnd)
+      );
+    }
   }
 
-  return subRegions.length > 0 ? subRegions : [region];
+  // 下半分
+  if (splitY <= region.yEnd) {
+    const lower = computeRegionBoundsInColumn(
+      dilated, width, splitY, region.yEnd, colXStart, colXEnd
+    );
+    if (lower) {
+      results.push(
+        ...splitOversizedRegion(dilated, width, lower, colXStart, colXEnd)
+      );
+    }
+  }
+
+  // 分割できなかった場合はそのまま返す
+  return results.length > 0 ? results : [region];
 }
 
 // ============================================================
 // カラム内バウンディングボックス計算
-// computeRegionBoundsのカラム制限版
+// computeRegionBoundsのカラム制限版（v1.6から変更なし）
 // ============================================================
 function computeRegionBoundsInColumn(dilated, width, yStart, yEnd, colXStart, colXEnd) {
   let xMin = Infinity, xMax = 0;
