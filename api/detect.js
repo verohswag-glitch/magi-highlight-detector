@@ -1,31 +1,40 @@
-import sharp from 'sharp';
+// ============================================================
+// detect.js v1.4 — 赤縦線ベース2段組制御 + 黄色マーカー検出
+// Round 9 確定仕様（Claude + Gemini統合設計 + 秘書くん修正提案）
+// ============================================================
+const Jimp = require('jimp');
 
 const CONFIG = {
-  // ===== v1.2 既存（変更なし） =====
-  RB_THRESHOLD: 40,
-  G_MIN: 170,
-  R_MIN: 200,
-  BRIGHTNESS_MIN: 200,
-  MIN_AREA_PX: 500,
-  DILATE_KERNEL_W: 3,
-  DILATE_KERNEL_H: 3,
-  CROP_MARGIN_X: 20,
-  CROP_MARGIN_Y: 10,
-  Y_GAP_THRESHOLD: 15,
-  X_GAP_THRESHOLD: 30,
-  WIDE_REGION_RATIO: 0.45,
-  MIN_COLUMN_WIDTH_RATIO: 0.10,
+  // --- 黄色マーカー検出（v1.2互換） ---
+  YELLOW_RB_DIFF: 40,
+  YELLOW_G_MIN: 170,
+  YELLOW_R_MIN: 200,
+  YELLOW_BRIGHTNESS_MIN: 200,
+  DILATE_RADIUS: 2,
+  MIN_REGION_HEIGHT: 10,
+  Y_GAP_THRESHOLD: 30,
 
-  // ===== v1.3 D-α段組検出 =====
-  COLUMN_GAP_MIN_WIDTH: 20,       // 段間ギャップの最小幅（px）
-  COLUMN_SCAN_LEFT: 0.30,         // 段境界を探す範囲の左端（画像幅の30%）
-  COLUMN_SCAN_RIGHT: 0.70,        // 段境界を探す範囲の右端（画像幅の70%）
-  COLUMN_DENSITY_THRESHOLD: 0.02, // この密度以下の列を「空白」と判定（行数に対する比率）
+  // --- 赤縦線検出（v1.4新規） ---
+  RED_RG_THRESHOLD: 100,
+  RED_RB_THRESHOLD: 100,
+  RED_R_MIN: 180,
+  RED_MIN_ASPECT_RATIO: 3,
+  RED_MIN_HEIGHT_PX: 50,
+  RED_MIN_HEIGHT_RATIO: 0.10,
+  RED_MAX_WIDTH: 30,
+
+  // --- 紐付け（E-L近接性検証, Gemini提案） ---
+  ASSOCIATION_X_MARGIN: 50,
+
+  // --- 50%境界方式（Claude推奨） ---
+  COLUMN_BOUNDARY: 0.50,
+  COLUMN_LEFT_CROP_LIMIT: 0.55,
+  COLUMN_RIGHT_CROP_LIMIT: 0.45,
 };
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'POST only' });
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
@@ -34,338 +43,490 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'image_base64 is required' });
     }
 
-    const imageBuffer = Buffer.from(image_base64, 'base64');
+    const buffer = Buffer.from(image_base64, 'base64');
+    const image = await Jimp.read(buffer);
+    const width = image.bitmap.width;
+    const height = image.bitmap.height;
 
-    const { data, info } = await sharp(imageBuffer)
-      .removeAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    // ================================================
+    // Step 1: 赤縦線検出（黄色検出より先に実行）
+    // ================================================
+    const redLines = detectRedLines(image, width, height);
 
-    const { width, height, channels } = info;
-
-    // ===== 色検出マスク（v1.2: 輝度条件追加） =====
-    const mask = new Uint8Array(width * height);
-    for (let i = 0; i < width * height; i++) {
-      const r = data[i * channels];
-      const g = data[i * channels + 1];
-      const b = data[i * channels + 2];
-      const brightness = (r + g + b) / 3;
-      mask[i] = (
-        r - b > CONFIG.RB_THRESHOLD &&
-        g > CONFIG.G_MIN &&
-        r > CONFIG.R_MIN &&
-        brightness > CONFIG.BRIGHTNESS_MIN
-      ) ? 1 : 0;
+    // ================================================
+    // Step 2: 黄色マーカー検出（v1.2互換ロジック）
+    // ================================================
+    const yellowMask = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        const r = image.bitmap.data[idx];
+        const g = image.bitmap.data[idx + 1];
+        const b = image.bitmap.data[idx + 2];
+        const brightness = (r + g + b) / 3;
+        if (
+          (r - b) > CONFIG.YELLOW_RB_DIFF &&
+          g > CONFIG.YELLOW_G_MIN &&
+          r > CONFIG.YELLOW_R_MIN &&
+          brightness > CONFIG.YELLOW_BRIGHTNESS_MIN
+        ) {
+          yellowMask[y * width + x] = 1;
+        }
+      }
     }
 
-    const dilated = dilate(mask, width, height, CONFIG.DILATE_KERNEL_W, CONFIG.DILATE_KERNEL_H);
+    // Dilate（膨張処理）
+    const dilated = dilate(yellowMask, width, height, CONFIG.DILATE_RADIUS);
 
-    // ===== v1.3: D-α 段組検出（画像全体のテキスト密度プロファイル） =====
-    const columnInfo = detectColumns(data, width, height, channels);
-
-    // ===== Y軸プロファイル → 行リージョン検出 =====
+    // Y軸プロジェクション
     const yProfile = new Uint32Array(height);
     for (let y = 0; y < height; y++) {
-      let count = 0;
       for (let x = 0; x < width; x++) {
-        if (dilated[y * width + x]) count++;
-      }
-      yProfile[y] = count;
-    }
-
-    const yRegions = [];
-    let inRegion = false;
-    let regionStart = 0;
-
-    for (let y = 0; y < height; y++) {
-      if (yProfile[y] > 0) {
-        if (!inRegion) {
-          inRegion = true;
-          regionStart = y;
-        }
-      } else {
-        if (inRegion) {
-          let gapEnd = y;
-          while (gapEnd < height && gapEnd - y < CONFIG.Y_GAP_THRESHOLD && yProfile[gapEnd] === 0) {
-            gapEnd++;
-          }
-          if (gapEnd < height && yProfile[gapEnd] > 0 && gapEnd - y < CONFIG.Y_GAP_THRESHOLD) {
-            continue;
-          }
-          yRegions.push({ yStart: regionStart, yEnd: y - 1 });
-          inRegion = false;
+        if (dilated[y * width + x]) {
+          yProfile[y]++;
         }
       }
     }
-    if (inRegion) {
-      yRegions.push({ yStart: regionStart, yEnd: height - 1 });
+
+    // Y軸分割 → 領域抽出
+    const rawRegions = extractRegions(dilated, yProfile, width, height);
+
+    // Y軸ギャップによるサブ分割
+    const regions = [];
+    for (const region of rawRegions) {
+      regions.push(...splitByYGap(dilated, width, region, CONFIG.Y_GAP_THRESHOLD));
     }
 
-    // ===== 各Y領域のbbox計算 + X軸分割（v1.2: 条件緩和） =====
-    const validRegions = [];
-    for (const region of yRegions) {
-      let xMin = width, xMax = 0;
-      let area = 0;
-
-      for (let y = region.yStart; y <= region.yEnd; y++) {
-        for (let x = 0; x < width; x++) {
-          if (dilated[y * width + x]) {
-            if (x < xMin) xMin = x;
-            if (x > xMax) xMax = x;
-            area++;
-          }
-        }
-      }
-
-      if (area < CONFIG.MIN_AREA_PX) continue;
-
-      // X軸分割チェック: 領域幅が画像幅の45%以上なら分割を試みる
-      const regionWidth = xMax - xMin;
-      if (regionWidth > width * CONFIG.WIDE_REGION_RATIO) {
-        const subRegions = splitByXGap(dilated, width, region.yStart, region.yEnd, xMin, xMax);
-        if (subRegions.length > 1) {
-          for (const sub of subRegions) {
-            if (sub.area >= CONFIG.MIN_AREA_PX) {
-              validRegions.push(sub);
-            }
-          }
-          continue;
-        }
-      }
-
-      validRegions.push({ yStart: region.yStart, yEnd: region.yEnd, xMin, xMax, area });
-    }
-
-    if (validRegions.length === 0) {
-      return res.status(200).json({
-        highlight_count: 0,
-        crops: [],
-        image_width: width,
-        image_height: height,
-        column_detected: columnInfo.detected,
-        message: 'NO_HIGHLIGHTS'
-      });
-    }
-
-    // ===== v1.3: 段組検出時はクロップを段内に制約 =====
-    const constrainedRegions = columnInfo.detected
-      ? validRegions.map(r => constrainToColumn(r, columnInfo, width))
-      : validRegions;
-
+    // ================================================
+    // Step 3: 赤縦線紐付け + クロップ生成
+    // ================================================
     const crops = [];
-    for (let i = 0; i < constrainedRegions.length; i++) {
-      const r = constrainedRegions[i];
-      const cropX = Math.max(0, r.xMin - CONFIG.CROP_MARGIN_X);
-      const cropY = Math.max(0, r.yStart - CONFIG.CROP_MARGIN_Y);
-      const cropW = Math.min(width - cropX, (r.xMax - r.xMin) + CONFIG.CROP_MARGIN_X * 2);
-      const cropH = Math.min(height - cropY, (r.yEnd - r.yStart) + CONFIG.CROP_MARGIN_Y * 2);
 
-      const croppedBuffer = await sharp(imageBuffer)
-        .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-        .png()
-        .toBuffer();
+    for (const region of regions) {
+      // Y範囲が重なる赤縦線を取得（E-Lはまだ未検証）
+      const yOverlappingLines = redLines.filter(
+        (l) => l.yMin <= region.yEnd && l.yMax >= region.yStart
+      );
 
-      crops.push({
-        index: i,
-        base64: croppedBuffer.toString('base64'),
-        bbox: { x: cropX, y: cropY, w: cropW, h: cropH },
-        area: r.area
-      });
+      if (yOverlappingLines.length > 0) {
+        // 赤縦線あり → 50%境界で左右分割し、E-L近接性をグループ別に検証
+        const columnCrops = await splitByRedLines(
+          dilated, image, width, height, region, yOverlappingLines
+        );
+        crops.push(...columnCrops);
+      } else {
+        // 赤縦線なし → v1.2互換（制限なしクロップ）
+        const cropBuf = await cropRegionBase64(
+          image, region.xMin, region.yStart,
+          region.xMax - region.xMin + 1, region.yEnd - region.yStart + 1
+        );
+        crops.push({
+          x: region.xMin,
+          y: region.yStart,
+          width: region.xMax - region.xMin + 1,
+          height: region.yEnd - region.yStart + 1,
+          column: 'none',
+          image_base64: cropBuf,
+        });
+      }
     }
 
+    // ================================================
+    // Step 4: レスポンス
+    // ================================================
     return res.status(200).json({
-      highlight_count: constrainedRegions.length,
-      crops,
       image_width: width,
       image_height: height,
-      column_detected: columnInfo.detected,
-      column_boundary: columnInfo.detected ? columnInfo.boundary : null
+      red_lines_detected: redLines.length > 0,
+      red_lines: redLines.map((l) => ({
+        xMin: l.xMin,
+        xMax: l.xMax,
+        yMin: l.yMin,
+        yMax: l.yMax,
+        width: l.xMax - l.xMin + 1,
+        height: l.yMax - l.yMin + 1,
+        columnSide:
+          l.xCenter < width * CONFIG.COLUMN_BOUNDARY ? 'left' : 'right',
+      })),
+      crops: crops.map((c) => ({
+        x: c.x,
+        y: c.y,
+        width: c.width,
+        height: c.height,
+        column: c.column,
+        image_base64: c.image_base64,
+      })),
+      crop_count: crops.length,
     });
-
-  } catch (err) {
-    console.error('Error:', err);
-    return res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error('Detection error:', error);
+    return res.status(500).json({
+      error: 'Detection failed',
+      message: error.message,
+    });
   }
-}
+};
 
-// ===== v1.3: D-α 段組検出 =====
-// 画像全体の「暗いピクセル」（テキスト領域）のX軸密度プロファイルを計算し、
-// 画像中央付近（30%-70%）に低密度の縦溝があれば「2段組」と判定する。
-function detectColumns(rawData, width, height, channels) {
-  const scanLeft = Math.floor(width * CONFIG.COLUMN_SCAN_LEFT);
-  const scanRight = Math.floor(width * CONFIG.COLUMN_SCAN_RIGHT);
-
-  // X軸の「テキストらしいピクセル」密度プロファイル
-  // テキスト = 暗いピクセル（brightness < 128）
-  const xDensity = new Uint32Array(width);
-  for (let x = scanLeft; x < scanRight; x++) {
-    let count = 0;
-    for (let y = 0; y < height; y++) {
-      const idx = (y * width + x) * channels;
-      const r = rawData[idx];
-      const g = rawData[idx + 1];
-      const b = rawData[idx + 2];
-      const brightness = (r + g + b) / 3;
-      if (brightness < 128) count++;
-    }
-    xDensity[x] = count;
-  }
-
-  // 低密度帯（縦溝）を探す
-  const densityThreshold = Math.floor(height * CONFIG.COLUMN_DENSITY_THRESHOLD);
-
-  let bestGapStart = -1;
-  let bestGapLen = 0;
-  let gapStart = -1;
-
-  for (let x = scanLeft; x < scanRight; x++) {
-    if (xDensity[x] <= densityThreshold) {
-      if (gapStart === -1) gapStart = x;
-    } else {
-      if (gapStart !== -1) {
-        const gapLen = x - gapStart;
-        if (gapLen > bestGapLen) {
-          bestGapLen = gapLen;
-          bestGapStart = gapStart;
-        }
-        gapStart = -1;
+// ============================================================
+// 赤縦線検出: 赤マスク → BFS 4連結フラッドフィル → フィルタ
+// ============================================================
+function detectRedLines(image, width, height) {
+  // 赤マスク生成
+  const redMask = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const r = image.bitmap.data[idx];
+      const g = image.bitmap.data[idx + 1];
+      const b = image.bitmap.data[idx + 2];
+      if (
+        (r - g) > CONFIG.RED_RG_THRESHOLD &&
+        (r - b) > CONFIG.RED_RB_THRESHOLD &&
+        r > CONFIG.RED_R_MIN
+      ) {
+        redMask[y * width + x] = 1;
       }
     }
   }
-  if (gapStart !== -1) {
-    const gapLen = scanRight - gapStart;
-    if (gapLen > bestGapLen) {
-      bestGapLen = gapLen;
-      bestGapStart = gapStart;
-    }
-  }
 
-  if (bestGapLen < CONFIG.COLUMN_GAP_MIN_WIDTH) {
-    return { detected: false };
-  }
-
-  // 段境界 = ギャップの中央
-  const boundary = Math.floor(bestGapStart + bestGapLen / 2);
-
-  return {
-    detected: true,
-    boundary,          // 段境界のX座標
-    gapStart: bestGapStart,
-    gapEnd: bestGapStart + bestGapLen,
-    gapWidth: bestGapLen
-  };
-}
-
-// ===== v1.3: クロップを段内に制約 =====
-// マーカー領域の中心X座標が段境界の左右どちらかで、クロップ範囲を段内に収める
-function constrainToColumn(region, columnInfo, imageWidth) {
-  const regionCenterX = Math.floor((region.xMin + region.xMax) / 2);
-  const boundary = columnInfo.boundary;
-
-  if (regionCenterX < boundary) {
-    // 左段: クロップの右端を段境界のギャップ開始位置に制限
-    return {
-      ...region,
-      xMax: Math.min(region.xMax, columnInfo.gapStart - 1)
-    };
-  } else {
-    // 右段: クロップの左端を段境界のギャップ終了位置に制限
-    return {
-      ...region,
-      xMin: Math.max(region.xMin, columnInfo.gapEnd)
-    };
-  }
-}
-
-// ===== X軸ギャップ分割（v1.2から変更なし） =====
-function splitByXGap(dilated, imgWidth, yStart, yEnd, xMin, xMax) {
-  const xProfile = new Uint32Array(imgWidth);
-  for (let x = xMin; x <= xMax; x++) {
-    let count = 0;
-    for (let y = yStart; y <= yEnd; y++) {
-      if (dilated[y * imgWidth + x]) count++;
-    }
-    xProfile[x] = count;
-  }
-
-  let bestGapStart = -1;
-  let bestGapLen = 0;
-  let gapStart = -1;
-
-  for (let x = xMin; x <= xMax; x++) {
-    if (xProfile[x] === 0) {
-      if (gapStart === -1) gapStart = x;
-    } else {
-      if (gapStart !== -1) {
-        const gapLen = x - gapStart;
-        if (gapLen > bestGapLen) {
-          bestGapLen = gapLen;
-          bestGapStart = gapStart;
-        }
-        gapStart = -1;
-      }
-    }
-  }
-  if (gapStart !== -1) {
-    const gapLen = (xMax + 1) - gapStart;
-    if (gapLen > bestGapLen) {
-      bestGapLen = gapLen;
-      bestGapStart = gapStart;
-    }
-  }
-
-  if (bestGapLen < CONFIG.X_GAP_THRESHOLD) {
-    return [];
-  }
-
-  const leftXMax = bestGapStart - 1;
-  const rightXMin = bestGapStart + bestGapLen;
-
-  const minColWidth = imgWidth * CONFIG.MIN_COLUMN_WIDTH_RATIO;
-  if (leftXMax - xMin < minColWidth || xMax - rightXMin < minColWidth) {
-    return [];
-  }
-
-  const regions = [];
-
-  let leftArea = 0;
-  for (let y = yStart; y <= yEnd; y++) {
-    for (let x = xMin; x <= leftXMax; x++) {
-      if (dilated[y * imgWidth + x]) leftArea++;
-    }
-  }
-  regions.push({ yStart, yEnd, xMin, xMax: leftXMax, area: leftArea });
-
-  let rightArea = 0;
-  for (let y = yStart; y <= yEnd; y++) {
-    for (let x = rightXMin; x <= xMax; x++) {
-      if (dilated[y * imgWidth + x]) rightArea++;
-    }
-  }
-  regions.push({ yStart, yEnd, xMin: rightXMin, xMax, area: rightArea });
-
-  return regions;
-}
-
-function dilate(mask, width, height, kw, kh) {
-  const halfW = Math.floor(kw / 2);
-  const halfH = Math.floor(kh / 2);
-  const result = new Uint8Array(width * height);
+  // BFS 4連結フラッドフィル → 連結成分ラベリング
+  const visited = new Uint8Array(width * height);
+  const components = [];
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      let found = false;
-      for (let ky = -halfH; ky <= halfH && !found; ky++) {
-        for (let kx = -halfW; kx <= halfW && !found; kx++) {
-          const ny = y + ky;
-          const nx = x + kx;
-          if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
-            if (mask[ny * width + nx]) found = true;
+      if (redMask[y * width + x] && !visited[y * width + x]) {
+        const queue = [];
+        let head = 0;
+        queue.push(y * width + x);
+        visited[y * width + x] = 1;
+
+        let cxMin = x, cxMax = x, cyMin = y, cyMax = y;
+        let pixelCount = 0;
+
+        while (head < queue.length) {
+          const pos = queue[head++];
+          const cy = Math.floor(pos / width);
+          const cx = pos % width;
+          pixelCount++;
+
+          if (cx < cxMin) cxMin = cx;
+          if (cx > cxMax) cxMax = cx;
+          if (cy < cyMin) cyMin = cy;
+          if (cy > cyMax) cyMax = cy;
+
+          // 4連結: 上下左右
+          const neighbors = [
+            cy > 0 ? (cy - 1) * width + cx : -1,
+            cy < height - 1 ? (cy + 1) * width + cx : -1,
+            cx > 0 ? cy * width + (cx - 1) : -1,
+            cx < width - 1 ? cy * width + (cx + 1) : -1,
+          ];
+          for (const nPos of neighbors) {
+            if (nPos >= 0 && redMask[nPos] && !visited[nPos]) {
+              visited[nPos] = 1;
+              queue.push(nPos);
+            }
+          }
+        }
+
+        components.push({
+          xMin: cxMin, xMax: cxMax,
+          yMin: cyMin, yMax: cyMax,
+          pixelCount,
+        });
+      }
+    }
+  }
+
+  // 縦線フィルタ
+  const minHeight = Math.max(
+    CONFIG.RED_MIN_HEIGHT_PX,
+    height * CONFIG.RED_MIN_HEIGHT_RATIO
+  );
+  const lines = [];
+
+  for (const comp of components) {
+    const compW = comp.xMax - comp.xMin + 1;
+    const compH = comp.yMax - comp.yMin + 1;
+    const aspectRatio = compH / Math.max(compW, 1);
+
+    if (
+      aspectRatio >= CONFIG.RED_MIN_ASPECT_RATIO &&
+      compH >= minHeight &&
+      compW <= CONFIG.RED_MAX_WIDTH
+    ) {
+      lines.push({
+        xMin: comp.xMin,
+        xMax: comp.xMax,
+        yMin: comp.yMin,
+        yMax: comp.yMax,
+        xCenter: (comp.xMin + comp.xMax) / 2,
+        pixelCount: comp.pixelCount,
+      });
+    }
+  }
+
+  return lines;
+}
+
+// ============================================================
+// 赤縦線ベースのクロップ分割（50%境界方式 + E-L近接性グループ別検証）
+// 修正提案#1反映: 片側のみ赤縦線ケースを正しく処理
+// ============================================================
+async function splitByRedLines(dilated, image, width, height, region, yOverlappingLines) {
+  const boundaryX = Math.floor(width * CONFIG.COLUMN_BOUNDARY);
+
+  // (1) マーカーピクセルを50%境界で左右に分割
+  let leftXMin = width, leftXMax = 0, leftYMin = height, leftYMax = 0;
+  let rightXMin = width, rightXMax = 0, rightYMin = height, rightYMax = 0;
+  let hasLeftPixels = false, hasRightPixels = false;
+
+  for (let y = region.yStart; y <= region.yEnd; y++) {
+    for (let x = region.xMin; x <= region.xMax; x++) {
+      if (dilated[y * width + x]) {
+        if (x < boundaryX) {
+          hasLeftPixels = true;
+          if (x < leftXMin) leftXMin = x;
+          if (x > leftXMax) leftXMax = x;
+          if (y < leftYMin) leftYMin = y;
+          if (y > leftYMax) leftYMax = y;
+        } else {
+          hasRightPixels = true;
+          if (x < rightXMin) rightXMin = x;
+          if (x > rightXMax) rightXMax = x;
+          if (y < rightYMin) rightYMin = y;
+          if (y > rightYMax) rightYMax = y;
+        }
+      }
+    }
+  }
+
+  // (2) E-L近接性検証をグループ別に実行
+  const hasLeftLine = hasLeftPixels && yOverlappingLines.some(
+    (l) => l.xMax <= leftXMin + CONFIG.ASSOCIATION_X_MARGIN
+  );
+  const hasRightLine = hasRightPixels && yOverlappingLines.some(
+    (l) => l.xMax <= rightXMin + CONFIG.ASSOCIATION_X_MARGIN
+  );
+
+  // (3) どちらのグループにもE-L紐付けが成立しない → v1.2互換にフォールバック
+  if (!hasLeftLine && !hasRightLine) {
+    const cropBuf = await cropRegionBase64(
+      image, region.xMin, region.yStart,
+      region.xMax - region.xMin + 1, region.yEnd - region.yStart + 1
+    );
+    return [{
+      x: region.xMin,
+      y: region.yStart,
+      width: region.xMax - region.xMin + 1,
+      height: region.yEnd - region.yStart + 1,
+      column: 'none',
+      image_base64: cropBuf,
+    }];
+  }
+
+  // (4) 左右それぞれのクロップ生成
+  const crops = [];
+  const cropLeftLimit = Math.floor(width * CONFIG.COLUMN_RIGHT_CROP_LIMIT);
+  const cropRightLimit = Math.floor(width * CONFIG.COLUMN_LEFT_CROP_LIMIT);
+
+  // 左段クロップ
+  if (hasLeftPixels) {
+    if (hasLeftLine) {
+      // 赤縦線あり → 右端を55%に制限
+      const clippedXMax = Math.min(leftXMax, cropRightLimit);
+      const cropBuf = await cropRegionBase64(
+        image, leftXMin, leftYMin,
+        clippedXMax - leftXMin + 1, leftYMax - leftYMin + 1
+      );
+      crops.push({
+        x: leftXMin, y: leftYMin,
+        width: clippedXMax - leftXMin + 1,
+        height: leftYMax - leftYMin + 1,
+        column: 'left',
+        image_base64: cropBuf,
+      });
+    } else {
+      // 赤縦線なし → v1.2互換（制限なし）
+      const cropBuf = await cropRegionBase64(
+        image, leftXMin, leftYMin,
+        leftXMax - leftXMin + 1, leftYMax - leftYMin + 1
+      );
+      crops.push({
+        x: leftXMin, y: leftYMin,
+        width: leftXMax - leftXMin + 1,
+        height: leftYMax - leftYMin + 1,
+        column: 'none',
+        image_base64: cropBuf,
+      });
+    }
+  }
+
+  // 右段クロップ
+  if (hasRightPixels) {
+    if (hasRightLine) {
+      // 赤縦線あり → 左端を45%に制限
+      const clippedXMin = Math.max(rightXMin, cropLeftLimit);
+      const cropBuf = await cropRegionBase64(
+        image, clippedXMin, rightYMin,
+        rightXMax - clippedXMin + 1, rightYMax - rightYMin + 1
+      );
+      crops.push({
+        x: clippedXMin, y: rightYMin,
+        width: rightXMax - clippedXMin + 1,
+        height: rightYMax - rightYMin + 1,
+        column: 'right',
+        image_base64: cropBuf,
+      });
+    } else {
+      // 赤縦線なし → v1.2互換（制限なし）
+      const cropBuf = await cropRegionBase64(
+        image, rightXMin, rightYMin,
+        rightXMax - rightXMin + 1, rightYMax - rightYMin + 1
+      );
+      crops.push({
+        x: rightXMin, y: rightYMin,
+        width: rightXMax - rightXMin + 1,
+        height: rightYMax - rightYMin + 1,
+        column: 'none',
+        image_base64: cropBuf,
+      });
+    }
+  }
+
+  return crops;
+}
+
+// ============================================================
+// ヘルパー関数群
+// ============================================================
+
+// Y軸プロジェクションから領域を抽出
+function extractRegions(dilated, yProfile, width, height) {
+  const regions = [];
+  let inRegion = false;
+  let regionStart = 0;
+
+  for (let y = 0; y <= height; y++) {
+    const active = y < height && yProfile[y] > 0;
+    if (active && !inRegion) {
+      inRegion = true;
+      regionStart = y;
+    } else if (!active && inRegion) {
+      inRegion = false;
+      const regionHeight = y - regionStart;
+      if (regionHeight >= CONFIG.MIN_REGION_HEIGHT) {
+        let xMin = width, xMax = 0;
+        for (let ry = regionStart; ry < y; ry++) {
+          for (let rx = 0; rx < width; rx++) {
+            if (dilated[ry * width + rx]) {
+              if (rx < xMin) xMin = rx;
+              if (rx > xMax) xMax = rx;
+            }
+          }
+        }
+        regions.push({ yStart: regionStart, yEnd: y - 1, xMin, xMax });
+      }
+    }
+  }
+  return regions;
+}
+
+// Dilate（膨張処理）— 正方形カーネル
+function dilate(mask, width, height, radius) {
+  const result = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (mask[y * width + x]) {
+        for (let dy = -radius; dy <= radius; dy++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            const ny = y + dy;
+            const nx = x + dx;
+            if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
+              result[ny * width + nx] = 1;
+            }
           }
         }
       }
-      result[y * width + x] = found ? 1 : 0;
     }
   }
   return result;
+}
+
+// Y軸ギャップによるサブ分割
+function splitByYGap(dilated, width, region, gapThreshold) {
+  const subRegions = [];
+  let currentStart = region.yStart;
+
+  for (let y = region.yStart; y <= region.yEnd; y++) {
+    let hasPixel = false;
+    for (let x = 0; x < width; x++) {
+      if (dilated[y * width + x]) {
+        hasPixel = true;
+        break;
+      }
+    }
+
+    if (!hasPixel) {
+      let gapEnd = y;
+      while (gapEnd <= region.yEnd) {
+        let nextHasPixel = false;
+        for (let x = 0; x < width; x++) {
+          if (dilated[gapEnd * width + x]) {
+            nextHasPixel = true;
+            break;
+          }
+        }
+        if (nextHasPixel) break;
+        gapEnd++;
+      }
+
+      const gapSize = gapEnd - y;
+      if (gapSize >= gapThreshold && y > currentStart) {
+        const sub = computeRegionBounds(dilated, width, currentStart, y - 1);
+        if (sub) subRegions.push(sub);
+        currentStart = gapEnd;
+      }
+      y = gapEnd - 1;
+    }
+  }
+
+  if (currentStart <= region.yEnd) {
+    const sub = computeRegionBounds(dilated, width, currentStart, region.yEnd);
+    if (sub) subRegions.push(sub);
+  }
+
+  return subRegions.length > 0 ? subRegions : [region];
+}
+
+// 領域のバウンディングボックスを計算
+function computeRegionBounds(dilated, width, yStart, yEnd) {
+  let xMin = Infinity, xMax = 0;
+  let hasPixels = false;
+  for (let y = yStart; y <= yEnd; y++) {
+    for (let x = 0; x < width; x++) {
+      if (dilated[y * width + x]) {
+        hasPixels = true;
+        if (x < xMin) xMin = x;
+        if (x > xMax) xMax = x;
+      }
+    }
+  }
+  if (!hasPixels) return null;
+  return { yStart, yEnd, xMin, xMax };
+}
+
+// 画像クロップ → base64
+async function cropRegionBase64(image, x, y, w, h) {
+  const safeX = Math.max(0, x);
+  const safeY = Math.max(0, y);
+  const safeW = Math.min(w, image.bitmap.width - safeX);
+  const safeH = Math.min(h, image.bitmap.height - safeY);
+
+  if (safeW <= 0 || safeH <= 0) return '';
+
+  const cropped = image.clone().crop(safeX, safeY, safeW, safeH);
+  const buf = await cropped.getBufferAsync(Jimp.MIME_PNG);
+  return buf.toString('base64');
 }
