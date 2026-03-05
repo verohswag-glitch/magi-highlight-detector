@@ -2,16 +2,18 @@ import sharp from 'sharp';
 
 const CONFIG = {
   RB_THRESHOLD: 40,
-  G_MIN: 150,
-  R_MIN: 180,
+  G_MIN: 170,
+  R_MIN: 200,
+  BRIGHTNESS_MIN: 200,
   MIN_AREA_PX: 500,
   DILATE_KERNEL_W: 3,
   DILATE_KERNEL_H: 3,
   CROP_MARGIN_X: 20,
   CROP_MARGIN_Y: 10,
   Y_GAP_THRESHOLD: 15,
-  X_GAP_THRESHOLD: 60,
-  MIN_COLUMN_WIDTH_RATIO: 0.15,
+  X_GAP_THRESHOLD: 30,
+  WIDE_REGION_RATIO: 0.45,
+  MIN_COLUMN_WIDTH_RATIO: 0.10,
 };
 
 export default async function handler(req, res) {
@@ -34,13 +36,19 @@ export default async function handler(req, res) {
 
     const { width, height, channels } = info;
 
-    // ===== 色検出マスク（v1.1: G, R 条件追加） =====
+    // ===== 色検出マスク（v1.2: 輝度条件追加） =====
     const mask = new Uint8Array(width * height);
     for (let i = 0; i < width * height; i++) {
       const r = data[i * channels];
       const g = data[i * channels + 1];
       const b = data[i * channels + 2];
-      mask[i] = (r - b > CONFIG.RB_THRESHOLD && g > CONFIG.G_MIN && r > CONFIG.R_MIN) ? 1 : 0;
+      const brightness = (r + g + b) / 3;
+      mask[i] = (
+        r - b > CONFIG.RB_THRESHOLD &&
+        g > CONFIG.G_MIN &&
+        r > CONFIG.R_MIN &&
+        brightness > CONFIG.BRIGHTNESS_MIN
+      ) ? 1 : 0;
     }
 
     const dilated = dilate(mask, width, height, CONFIG.DILATE_KERNEL_W, CONFIG.DILATE_KERNEL_H);
@@ -83,7 +91,7 @@ export default async function handler(req, res) {
       yRegions.push({ yStart: regionStart, yEnd: height - 1 });
     }
 
-    // ===== 各Y領域のbbox計算 + X軸分割（v1.1新機能） =====
+    // ===== 各Y領域のbbox計算 + X軸分割（v1.2: 条件緩和） =====
     const validRegions = [];
     for (const region of yRegions) {
       let xMin = width, xMax = 0;
@@ -101,9 +109,9 @@ export default async function handler(req, res) {
 
       if (area < CONFIG.MIN_AREA_PX) continue;
 
-      // X軸分割チェック: 領域幅が画像幅の60%以上なら分割を試みる
+      // X軸分割チェック: 領域幅が画像幅の45%以上なら分割を試みる
       const regionWidth = xMax - xMin;
-      if (regionWidth > width * 0.6) {
+      if (regionWidth > width * CONFIG.WIDE_REGION_RATIO) {
         const subRegions = splitByXGap(dilated, width, region.yStart, region.yEnd, xMin, xMax);
         if (subRegions.length > 1) {
           for (const sub of subRegions) {
@@ -162,9 +170,8 @@ export default async function handler(req, res) {
   }
 }
 
-// ===== X軸ギャップ分割（v1.1新機能） =====
+// ===== X軸ギャップ分割 =====
 function splitByXGap(dilated, imgWidth, yStart, yEnd, xMin, xMax) {
-  // X軸プロファイル: 各X座標のピクセル数
   const xProfile = new Uint32Array(imgWidth);
   for (let x = xMin; x <= xMax; x++) {
     let count = 0;
@@ -174,7 +181,6 @@ function splitByXGap(dilated, imgWidth, yStart, yEnd, xMin, xMax) {
     xProfile[x] = count;
   }
 
-  // 最大ギャップを探す
   let bestGapStart = -1;
   let bestGapLen = 0;
   let gapStart = -1;
@@ -201,23 +207,20 @@ function splitByXGap(dilated, imgWidth, yStart, yEnd, xMin, xMax) {
     }
   }
 
-  // ギャップが十分大きい場合のみ分割
   if (bestGapLen < CONFIG.X_GAP_THRESHOLD) {
-    return []; // 分割しない
+    return [];
   }
 
-  // 左右それぞれの領域を構築
   const leftXMax = bestGapStart - 1;
   const rightXMin = bestGapStart + bestGapLen;
 
   const minColWidth = imgWidth * CONFIG.MIN_COLUMN_WIDTH_RATIO;
   if (leftXMax - xMin < minColWidth || xMax - rightXMin < minColWidth) {
-    return []; // 片方が小さすぎる場合は分割しない
+    return [];
   }
 
   const regions = [];
 
-  // 左領域
   let leftArea = 0;
   for (let y = yStart; y <= yEnd; y++) {
     for (let x = xMin; x <= leftXMax; x++) {
@@ -226,7 +229,6 @@ function splitByXGap(dilated, imgWidth, yStart, yEnd, xMin, xMax) {
   }
   regions.push({ yStart, yEnd, xMin, xMax: leftXMax, area: leftArea });
 
-  // 右領域
   let rightArea = 0;
   for (let y = yStart; y <= yEnd; y++) {
     for (let x = rightXMin; x <= xMax; x++) {
