@@ -2,7 +2,7 @@ const sharp = require('sharp');
 
 module.exports = async (req, res) => {
   try {
-    const { image } = req.body;
+    const image = req.body.image || req.body.image_base64;
     if (!image) return res.status(400).json({ error: 'No image provided' });
 
     const buf = Buffer.from(image, 'base64');
