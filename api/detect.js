@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
       DILATE_RADIUS: 2,
       MIN_REGION_HEIGHT: 25,
       Y_GAP_THRESHOLD: 60,
-      YELLOW_DENSITY_MIN: 0.07,
+      YELLOW_DENSITY_MIN: 0.06,
       MAX_CROP_HEIGHT: 500,
 
       // Red line detection
