@@ -16,10 +16,10 @@ const CONFIG = {
   YELLOW_BRIGHTNESS_MIN: 200,
   DILATE_RADIUS: 2,
   MIN_REGION_HEIGHT: 25,
-  Y_GAP_THRESHOLD: 60,
+  Y_GAP_THRESHOLD: 75,
 
   // --- 黄色密度閾値（v1.6.1新規 — Error 20対策） ---
-  YELLOW_DENSITY_MIN: 0.07,
+  YELLOW_DENSITY_MIN: 0.10,
 
   // --- 最大クロップ高さ（v1.6.1新規 — Error 19再発防止） ---
   MAX_CROP_HEIGHT: 500,
@@ -38,7 +38,7 @@ const CONFIG = {
 
   // --- 最小クロップサイズフィルタ（v1.5継承） ---
   MIN_CROP_WIDTH: 50,
-  MIN_CROP_HEIGHT: 20,
+  MIN_CROP_HEIGHT: 30,
 };
 
 module.exports = async (req, res) => {
