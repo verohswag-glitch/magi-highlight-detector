@@ -1,8 +1,5 @@
 {
-  "name": "magi-highlight-detector",
-  "version": "1.4.0",
-  "private": true,
   "dependencies": {
-    "jimp": "^0.22.12"
+    "sharp": "^0.33.2"
   }
 }
