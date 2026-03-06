@@ -16,10 +16,10 @@ const CONFIG = {
   YELLOW_BRIGHTNESS_MIN: 200,
   DILATE_RADIUS: 2,
   MIN_REGION_HEIGHT: 25,
-  Y_GAP_THRESHOLD: 50,
+  Y_GAP_THRESHOLD: 60,
 
   // --- 黄色密度閾値（v1.6.1新規 — Error 20対策） ---
-  YELLOW_DENSITY_MIN: 0.05,
+  YELLOW_DENSITY_MIN: 0.07,
 
   // --- 最大クロップ高さ（v1.6.1新規 — Error 19再発防止） ---
   MAX_CROP_HEIGHT: 500,
